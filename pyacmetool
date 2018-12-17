@@ -1,0 +1,325 @@
+#!/usr/bin/python3
+
+import argparse
+import base64
+import datetime
+import glob
+import hashlib
+import logging
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+import concurrent.futures
+
+import acme.client
+import acme.messages
+import cryptography.hazmat.backends
+import cryptography.hazmat.primitives.asymmetric.rsa
+import cryptography.hazmat.primitives.serialization
+import josepy
+import OpenSSL
+import yaml
+
+def fdb_hash(data):
+    return base64.b32encode(hashlib.sha256(data).digest()).decode().rstrip('=').lower()
+
+def get_key_id(public_key):
+    return fdb_hash(public_key.public_numbers().n.to_bytes(256, 'big'))
+
+def write_with_perms(file, data, mode):
+    with open(file, 'w+') as fd: pass
+    os.chmod(file, mode)
+    with open(file, 'wb+') as fd:
+        if isinstance(data, str):
+            data = data.encode('utf-8')
+        fd.write(data)
+
+def run_hooks(hook_args, stdin=None):
+    success = False
+    for hook in os.listdir(args.hooks):
+        cmd = [os.path.join(args.hooks, hook)] + list(hook_args)
+        logger.debug('hooks: running %r', cmd)
+        try:
+            p = subprocess.Popen(cmd, stdin=(stdin and subprocess.PIPE or open('/dev/null')))
+            if stdin:
+                if isinstance(stdin, str):
+                    stdin = stdin.encode('utf-8')
+                p.stdin.write(stdin)
+                p.stdin.close()
+            status = p.wait()
+        except:
+            status = -1
+        if status == 0:
+            success = True
+            logger.debug('hook %s: success', hook)
+        elif status == 42:
+            logger.debug('hook %s: ignored', hook)
+        else:
+            logger.debug('hook %s: error', hook)
+    return success
+
+def check_require_new_order(domain):
+    domain_dir = os.path.join(args.state, 'live', domain)
+    cert_file = os.path.join(domain_dir, 'cert')
+    if os.path.exists(cert_file):
+        cert = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, open(cert_file).read())
+        expiration = datetime.datetime.strptime(cert.get_notAfter().decode().replace('Z','+0000'), '%Y%m%d%H%M%S%z')
+        if expiration - datetime.datetime.now(expiration.tzinfo) < datetime.timedelta(days=30):
+            logger.debug('%s: cert %s will expire in less than 30 days (%s), renewing' % (domain, os.readlink(domain_dir), expiration.isoformat()))
+            return True
+        else:
+            logger.debug('%s: will reuse cert %s' % (domain, os.readlink(domain_dir)))
+            return False
+    else:
+        logger.debug('%s: require new certificate' % domain)
+        return True
+
+def handle_authorization(client, authz):
+    logger.debug('%s: authz status=%s', authz.body.identifier.value, authz.body.status.name)
+
+    if authz.body.status == acme.messages.STATUS_VALID:
+        return True
+
+    stop_hooks = []
+    challenge_files = []
+
+    challenge_accepted = False
+    for challenge in authz.body.challenges:
+        logger.debug('%s: challenge %s status=%s', authz.body.identifier.value, challenge.chall.typ, challenge.status.name)
+
+        if isinstance(challenge.chall, acme.challenges.DNS01) and challenge.status == acme.messages.STATUS_PENDING:
+            stop_hooks.append(('challenge-dns-stop', authz.body.identifier.value, '', challenge.chall.validation(net.key)))
+            if run_hooks(('challenge-dns-start', authz.body.identifier.value, '', challenge.chall.validation(net.key))):
+                logger.debug('%s: using dns-01 challenge', authz.body.identifier.value)
+                challenge_accepted = True
+                client.answer_challenge(challenge, acme.challenges.DNS01Response())
+                break
+
+        if isinstance(challenge.chall, acme.challenges.HTTP01) and challenge.status == acme.messages.STATUS_PENDING:
+            webroot_paths = conf['request'].get('challenge', {}).get('webroot-paths', [])
+            challenge_token = challenge.chall.encode('token')
+            challenge_validation = challenge.chall.validation(net.key)
+            http_challenge_accepted = False
+            for webroot_path in webroot_paths:
+                challenge_file = os.path.join(webroot_path, challenge_token)
+                try:
+                    write_with_perms(challenge_file, challenge_validation, 0o644)
+                    challenge_files.append(challenge_file)
+                    http_challenge_accepted = True
+                    logger.debug('%s: writing http-01 challenge to %s', authz.body.identifier.value, challenge_file)
+                except Exception as e:
+                    logger.debug('%s: writing http-01 challenge to %s failed: %r', authz.body.identifier.value, challenge_file, e)
+            if run_hooks(('challenge-http-start', authz.body.identifier.value, '', challenge_token), stdin=challenge_validation):
+                http_challenge_accepted = True
+            stop_hooks.append(('challenge-http-stop', authz.body.identifier.value, '', challenge_token))
+            if http_challenge_accepted:
+                logger.debug('%s: using http-01 challenge', authz.body.identifier.value)
+                challenge_accepted = True
+                client.answer_challenge(challenge, acme.challenges.HTTP01Response())
+                break
+
+    if not challenge_accepted:
+        logger.warn('%s: no acceptable challenge found', authz.body.identifier.value)
+        for hook in stop_hooks:
+            run_hooks(hook)
+        return False
+
+    logger.debug('%s: waiting for challenge completion', authz.body.identifier.value)
+    while authz.body.status == acme.messages.STATUS_PENDING:
+        authz, _ = client.poll(authz)
+        logger.debug('%s: authz status=%s (%s)', authz.body.identifier.value, authz.body.status.name,
+                ' '.join('%s=%s' % (challenge.chall.typ, challenge.status.name) for challenge in authz.body.challenges))
+        # TODO: retry_after
+        time.sleep(5)
+
+    for challenge_file in challenge_files:
+        os.unlink(challenge_file)
+
+    for hook in stop_hooks:
+        run_hooks(hook)
+
+    if authz.body.status == acme.messages.STATUS_VALID:
+        return True
+    else:
+        logger.warn('Validation for %s failed' % authz.body.identifier.value)
+        return False
+
+def order_cert(client, cert_key_pem, domains):
+    cert_key_openssl = OpenSSL.crypto.load_privatekey(OpenSSL.crypto.FILETYPE_PEM, cert_key_pem)
+    csr = OpenSSL.crypto.X509Req()
+    csr.set_pubkey(cert_key_openssl)
+    csr.set_version(2)
+    csr.add_extensions([
+        OpenSSL.crypto.X509Extension(
+            b'subjectAltName',
+            critical=False,
+            value=', '.join('DNS:' + d for d in domains).encode('ascii')
+            )])
+    csr.sign(cert_key_openssl, 'sha256')
+    csr_pem = OpenSSL.crypto.dump_certificate_request(OpenSSL.crypto.FILETYPE_PEM, csr)
+    order = client.new_order(csr_pem)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(handle_authorization, client, authz) for authz in order.authorizations]
+        authz_results = [f.result() for f in futures]
+
+    if all(authz_results):
+        order = client.finalize_order(order, deadline=datetime.datetime.now()+datetime.timedelta(seconds=30))
+        certs_pem = re.findall(r'^-----BEGIN CERTIFICATE-----\n.*?\n-----END CERTIFICATE-----', order.fullchain_pem, re.S | re.M)
+
+        return order.body.certificate, certs_pem
+    else:
+        raise Exception('Some domain could not be authorized')
+
+def write_cert_key(cert_key_id, cert_key_pem):
+    key_dir = os.path.join(args.state, 'keys', cert_key_id)
+    os.mkdir(key_dir, 0o700)
+    write_with_perms(os.path.join(key_dir, 'privkey'), cert_key_pem, 0o600)
+
+def write_cert(uri, fullchain):
+    cert_dir = os.path.join(args.state, 'certs', fdb_hash(uri.encode()))
+    os.mkdir(cert_dir, 0o755)
+    write_with_perms(os.path.join(cert_dir, 'fullchain'), '\n'.join(fullchain) + '\n', 0o644)
+    write_with_perms(os.path.join(cert_dir, 'chain'), '\n'.join(fullchain[1:]) + '\n', 0o644)
+    write_with_perms(os.path.join(cert_dir, 'cert'), fullchain[0] + '\n', 0o644)
+    write_with_perms(os.path.join(cert_dir, 'url'), uri + '\n', 0o644)
+    os.symlink(os.path.join('..', '..', 'keys', cert_key_id, 'privkey'), os.path.join(cert_dir, 'privkey'))
+
+def setup_cert(uri, domain):
+    domain_dir = os.path.join(args.state, 'live', domain)
+    if os.path.exists(domain_dir) and os.path.islink(domain_dir):
+        os.unlink(domain_dir)
+    os.symlink(os.path.join('..', 'certs', fdb_hash(uri.encode())), domain_dir)
+
+logging.basicConfig()
+logger = logging.getLogger('pyacmetool')
+
+for facility in os.environ.get('DEBUG', '').split(','):
+    if facility:
+        level = logging.DEBUG
+        if '=' in facility:
+            facility, level = facility.split('=')
+            facility = facility.strip()
+            level = getattr(logging, level.upper().strip())
+        if facility.lower() in ('root','*','all'):
+            facility = None
+        logging.getLogger(facility).setLevel(level)
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--state', default=os.environ.get('ACME_STATE_DIR', '/var/lib/pyacme'))
+parser.add_argument('--hooks', default=os.environ.get('ACME_HOOKS_DIR', '/etc/acme/hooks'))
+parser.add_argument('--batch', action='store_true')
+
+subparsers = parser.add_subparsers(dest='action')
+reconcile_p = subparsers.add_parser('reconcile')
+init_p = subparsers.add_parser('init')
+tos_p = subparsers.add_parser('tos')
+
+init_p.add_argument('--tos', '-t', required=True)
+init_p.add_argument('--email', '-m', required=True)
+init_p.add_argument('--provider-url', '-u', default='https://acme-staging-v02.api.letsencrypt.org/directory')
+init_p.add_argument('--webroot-path', '-w')
+
+tos_p.add_argument('--provider-url', '-u', default='https://acme-staging-v02.api.letsencrypt.org/directory')
+
+args = parser.parse_args()
+
+dirs = ['accounts', 'certs', 'conf', 'desired', 'keys', 'live', 'tmp']
+
+conf = {}
+if os.path.exists(os.path.join(args.state, 'conf', 'target')):
+    conf = yaml.load(open(os.path.join(args.state, 'conf', 'target')))
+
+if not os.path.exists(args.state):
+    os.mkdir(args.state)
+for dir in dirs:
+    if not os.path.exists(os.path.join(args.state, dir)):
+        os.mkdir(os.path.join(args.state, dir))
+    if dir in ['accounts', 'keys', 'tmp']:
+        expected_mode = 0o700
+    else:
+        expected_mode = 0o755
+    os.chmod(os.path.join(args.state, dir), expected_mode)
+
+if args.action is None or args.action == 'reconcile':
+    account_dir = glob.glob(os.path.join(args.state, 'accounts', '*', '*'))[0]
+    logger.debug('Using account: %s' % account_dir)
+    key = cryptography.hazmat.primitives.serialization.load_pem_private_key(
+            data=open(os.path.join(account_dir, 'privkey'), 'rb').read(),
+            password=None,
+            backend=cryptography.hazmat.backends.default_backend())
+    account = {'uri': open(os.path.join(account_dir, 'url'), 'r').read()}
+    net = acme.client.ClientNetwork(josepy.JWKRSA(key=key), account=account)
+    directory = acme.messages.Directory.from_json(net.get(conf['request']['provider']).json())
+    client = acme.client.ClientV2(directory, net)
+
+    updated = False
+
+    for desired_file in os.listdir(os.path.join(args.state, 'desired')):
+        domains = yaml.load(open(os.path.join(args.state, 'desired', desired_file))).get('satisfy',{}).get('names',[])
+
+        new_order_required = False
+        for domain in domains:
+            if check_require_new_order(domain):
+                new_order_required = True
+                break
+        if not new_order_required:
+            continue
+
+        cert_key = cryptography.hazmat.primitives.asymmetric.rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=cryptography.hazmat.backends.default_backend())
+        cert_key_pem = cert_key.private_bytes(encoding=cryptography.hazmat.primitives.serialization.Encoding.PEM,
+                format=cryptography.hazmat.primitives.serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=cryptography.hazmat.primitives.serialization.NoEncryption())
+        cert_key_id = get_key_id(cert_key.public_key())
+
+        uri, certs_pem = order_cert(client, cert_key_pem, domains)
+
+        write_cert_key(cert_key_id, cert_key_pem)
+        write_cert(uri, certs_pem)
+        for domain in domains:
+            setup_cert(uri, domain)
+
+        updated = True
+
+    if updated:
+        run_hooks(('live-updated',))
+
+elif args.action == 'tos':
+    net = acme.client.ClientNetwork(None)
+    directory = acme.messages.Directory.from_json(net.get(args.provider_url).json())
+    print(directory.meta.terms_of_service)
+
+elif args.action == 'init':
+    key = cryptography.hazmat.primitives.asymmetric.rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=cryptography.hazmat.backends.default_backend())
+    key_id = get_key_id(key.public_key())
+    priv_pem = key.private_bytes(encoding=cryptography.hazmat.primitives.serialization.Encoding.PEM,
+            format=cryptography.hazmat.primitives.serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=cryptography.hazmat.primitives.serialization.NoEncryption())
+
+    net = acme.client.ClientNetwork(josepy.JWKRSA(key=key))
+    directory = acme.messages.Directory.from_json(net.get(args.provider_url).json())
+    client = acme.client.ClientV2(directory, net)
+    if args.tos != client.directory.meta.terms_of_service:
+        print('Please agree to latest terms of service', file=sys.stderr)
+        sys.exit(1)
+    reg = client.new_account(acme.messages.NewRegistration.from_data(email=args.email, terms_of_service_agreed=True))
+
+    logger.debug('New account: %s' % key_id)
+    directory_id = urllib.parse.quote(args.provider_url.split(':',1)[-1].lstrip('/'), safe='')
+    account_dir = os.path.join(args.state, 'accounts', directory_id, key_id)
+    os.makedirs(account_dir, 0o700)
+    write_with_perms(os.path.join(account_dir, 'privkey'), priv_pem, 0o600)
+    write_with_perms(os.path.join(account_dir, 'url'), reg.uri, 0o600)
+
+    conf.setdefault('request', {})['provider'] = args.provider_url
+    conf['request'].setdefault('key', {})['type'] = 'rsa'
+    if args.webroot_path:
+        conf['request'].setdefault('challenge', {}).setdefault('webroot-paths', []).append(args.webroot_path)
+    conf_data = yaml.dump(conf)
+    write_with_perms(os.path.join(args.state, 'conf', 'target'), conf_data, 0o644)
+
+else:
+    raise NotImplementedError
