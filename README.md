@@ -1,3 +1,11 @@
+# Depreciation Notice
+
+This project was intended as a temporary replacement for acmetool. Since
+I have abandonned all hope for a new release of acmetool, I had to
+migrate to another solution ([lego](https://github.com/go-acme/lego)).
+
+As a consequence, I will not maintain pyacmetool anymore.
+
 # Introduction
 
 There are many ACME/letsencrypt clients out there, but none that quite
